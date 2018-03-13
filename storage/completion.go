@@ -6,18 +6,22 @@ import (
 	"github.com/anacrolix/torrent/metainfo"
 )
 
+type PieceCompletionGetSetter interface {
+	Get(metainfo.PieceKey) (Completion, error)
+	Set(_ metainfo.PieceKey, complete bool) error
+}
+
 // Implementations track the completion of pieces. It must be concurrent-safe.
-type pieceCompletion interface {
-	Get(metainfo.PieceKey) (bool, error)
-	Set(metainfo.PieceKey, bool) error
+type PieceCompletion interface {
+	PieceCompletionGetSetter
 	Close() error
 }
 
-func pieceCompletionForDir(dir string) (ret pieceCompletion) {
-	ret, err := newBoltPieceCompletion(dir)
+func pieceCompletionForDir(dir string) (ret PieceCompletion) {
+	ret, err := NewBoltPieceCompletion(dir)
 	if err != nil {
 		log.Printf("couldn't open piece completion db in %q: %s", dir, err)
-		ret = new(mapPieceCompletion)
+		ret = NewMapPieceCompletion()
 	}
 	return
 }

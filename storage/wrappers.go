@@ -1,7 +1,6 @@
 package storage
 
 import (
-	"errors"
 	"io"
 	"os"
 
@@ -11,7 +10,7 @@ import (
 )
 
 type Client struct {
-	ClientImpl
+	ci ClientImpl
 }
 
 func NewClient(cl ClientImpl) *Client {
@@ -19,7 +18,7 @@ func NewClient(cl ClientImpl) *Client {
 }
 
 func (cl Client) OpenTorrent(info *metainfo.Info, infoHash metainfo.Hash) (*Torrent, error) {
-	t, err := cl.ClientImpl.OpenTorrent(info, infoHash)
+	t, err := cl.ci.OpenTorrent(info, infoHash)
 	return &Torrent{t}, err
 }
 
@@ -37,14 +36,19 @@ type Piece struct {
 }
 
 func (p Piece) WriteAt(b []byte, off int64) (n int, err error) {
-	if p.GetIsComplete() {
-		err = errors.New("piece completed")
-		return
-	}
+	// Callers should not be writing to completed pieces, but it's too
+	// expensive to be checking this on every single write using uncached
+	// completions.
+
+	// c := p.Completion()
+	// if c.Ok && c.Complete {
+	// 	err = errors.New("piece already completed")
+	// 	return
+	// }
 	if off+int64(len(b)) > p.mip.Length() {
 		panic("write overflows piece")
 	}
-	missinggo.LimitLen(&b, p.mip.Length()-off)
+	b = missinggo.LimitLen(b, p.mip.Length()-off)
 	return p.PieceImpl.WriteAt(b, off)
 }
 
@@ -57,7 +61,7 @@ func (p Piece) ReadAt(b []byte, off int64) (n int, err error) {
 		err = io.EOF
 		return
 	}
-	missinggo.LimitLen(&b, p.mip.Length()-off)
+	b = missinggo.LimitLen(b, p.mip.Length()-off)
 	if len(b) == 0 {
 		return
 	}

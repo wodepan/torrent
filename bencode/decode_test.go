@@ -70,6 +70,32 @@ func TestDecoderConsecutive(t *testing.T) {
 	require.Equal(t, io.EOF, err)
 }
 
+func TestDecoderConsecutiveDicts(t *testing.T) {
+	bb := bytes.NewBufferString("d4:herp4:derped3:wat1:ke17:oh baby a triple!")
+
+	d := NewDecoder(bb)
+	assert.EqualValues(t, "d4:herp4:derped3:wat1:ke17:oh baby a triple!", bb.Bytes())
+	assert.EqualValues(t, 0, d.Offset)
+
+	var m map[string]interface{}
+
+	require.NoError(t, d.Decode(&m))
+	assert.Len(t, m, 1)
+	assert.Equal(t, "derp", m["herp"])
+	assert.Equal(t, "d3:wat1:ke17:oh baby a triple!", bb.String())
+	assert.EqualValues(t, 14, d.Offset)
+
+	require.NoError(t, d.Decode(&m))
+	assert.Equal(t, "k", m["wat"])
+	assert.Equal(t, "17:oh baby a triple!", bb.String())
+	assert.EqualValues(t, 24, d.Offset)
+
+	var s string
+	require.NoError(t, d.Decode(&s))
+	assert.Equal(t, "oh baby a triple!", s)
+	assert.EqualValues(t, 44, d.Offset)
+}
+
 func check_error(t *testing.T, err error) {
 	if err != nil {
 		t.Error(err)
@@ -109,4 +135,35 @@ func TestUnmarshalerBencode(t *testing.T) {
 	assert_equal(t, ss[1].x, "5:fruit")
 	assert_equal(t, ss[2].x, "3:way")
 
+}
+
+func TestIgnoreUnmarshalTypeError(t *testing.T) {
+	s := struct {
+		Ignore int `bencode:",ignore_unmarshal_type_error"`
+		Normal int
+	}{}
+	require.Error(t, Unmarshal([]byte("d6:Normal5:helloe"), &s))
+	assert.Nil(t, Unmarshal([]byte("d6:Ignore5:helloe"), &s))
+	require.Nil(t, Unmarshal([]byte("d6:Ignorei42ee"), &s))
+	assert.EqualValues(t, 42, s.Ignore)
+}
+
+// Test unmarshalling []byte into something that has the same kind but
+// different type.
+func TestDecodeCustomSlice(t *testing.T) {
+	type flag byte
+	var fs3, fs2 []flag
+	// We do a longer slice then a shorter slice to see if the buffers are
+	// shared.
+	d := NewDecoder(bytes.NewBufferString("3:\x01\x10\xff2:\x04\x0f"))
+	require.NoError(t, d.Decode(&fs3))
+	require.NoError(t, d.Decode(&fs2))
+	assert.EqualValues(t, []flag{1, 16, 255}, fs3)
+	assert.EqualValues(t, []flag{4, 15}, fs2)
+}
+
+func TestUnmarshalUnusedBytes(t *testing.T) {
+	var i int
+	require.EqualValues(t, ErrUnusedTrailingBytes{1}, Unmarshal([]byte("i42ee"), &i))
+	assert.EqualValues(t, 42, i)
 }

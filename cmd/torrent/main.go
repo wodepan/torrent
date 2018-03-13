@@ -2,6 +2,7 @@
 package main
 
 import (
+	"expvar"
 	"fmt"
 	"log"
 	"net"
@@ -10,7 +11,10 @@ import (
 	"strings"
 	"time"
 
-	_ "github.com/anacrolix/envpprof"
+	"github.com/anacrolix/torrent/iplist"
+
+	"github.com/anacrolix/dht"
+	"github.com/anacrolix/envpprof"
 	"github.com/anacrolix/tagflag"
 	"github.com/dustin/go-humanize"
 	"github.com/gosuri/uiprogress"
@@ -21,23 +25,10 @@ import (
 	"github.com/anacrolix/torrent/storage"
 )
 
-func resolvedPeerAddrs(ss []string) (ret []torrent.Peer, err error) {
-	for _, s := range ss {
-		var addr *net.TCPAddr
-		addr, err = net.ResolveTCPAddr("tcp", s)
-		if err != nil {
-			return
-		}
-		ret = append(ret, torrent.Peer{
-			IP:   addr.IP,
-			Port: addr.Port,
-		})
-	}
-	return
-}
+var progress = uiprogress.New()
 
 func torrentBar(t *torrent.Torrent) {
-	bar := uiprogress.AddBar(1)
+	bar := progress.AddBar(1)
 	bar.AppendCompleted()
 	bar.AppendFunc(func(*uiprogress.Bar) (ret string) {
 		select {
@@ -132,12 +123,14 @@ func addTorrents(client *torrent.Client) {
 }
 
 var flags = struct {
-	Mmap         bool           `help:"memory-map torrent data"`
-	TestPeer     []*net.TCPAddr `help:"addresses of some starting peers"`
-	Seed         bool           `help:"seed after download is complete"`
-	Addr         *net.TCPAddr   `help:"network listen addr"`
-	UploadRate   tagflag.Bytes  `help:"max piece bytes to send per second"`
-	DownloadRate tagflag.Bytes  `help:"max bytes per second down from peers"`
+	Mmap            bool           `help:"memory-map torrent data"`
+	TestPeer        []*net.TCPAddr `help:"addresses of some starting peers"`
+	Seed            bool           `help:"seed after download is complete"`
+	Addr            *net.TCPAddr   `help:"network listen addr"`
+	UploadRate      tagflag.Bytes  `help:"max piece bytes to send per second"`
+	DownloadRate    tagflag.Bytes  `help:"max bytes per second down from peers"`
+	Debug           bool
+	PackedBlocklist string
 	tagflag.StartPos
 	Torrent []string `arity:"+" help:"torrent file path or magnet uri"`
 }{
@@ -145,18 +138,35 @@ var flags = struct {
 	DownloadRate: -1,
 }
 
+func stdoutAndStderrAreSameFile() bool {
+	fi1, _ := os.Stdout.Stat()
+	fi2, _ := os.Stderr.Stat()
+	return os.SameFile(fi1, fi2)
+}
+
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 	tagflag.Parse(&flags)
-	var clientConfig torrent.Config
+	clientConfig := torrent.Config{
+		DHTConfig: dht.ServerConfig{
+			StartingNodes: dht.GlobalBootstrapAddrs,
+		},
+		Debug: flags.Debug,
+		Seed:  flags.Seed,
+	}
+	if flags.PackedBlocklist != "" {
+		blocklist, err := iplist.MMapPackedFile(flags.PackedBlocklist)
+		if err != nil {
+			log.Fatalf("error loading blocklist: %s", err)
+		}
+		defer blocklist.Close()
+		clientConfig.IPBlocklist = blocklist
+	}
 	if flags.Mmap {
 		clientConfig.DefaultStorage = storage.NewMMap("")
 	}
 	if flags.Addr != nil {
 		clientConfig.ListenAddr = flags.Addr.String()
-	}
-	if flags.Seed {
-		clientConfig.Seed = true
 	}
 	if flags.UploadRate != -1 {
 		clientConfig.UploadRateLimiter = rate.NewLimiter(rate.Limit(flags.UploadRate), 256<<10)
@@ -176,7 +186,10 @@ func main() {
 	http.HandleFunc("/", func(w http.ResponseWriter, req *http.Request) {
 		client.WriteStatus(w)
 	})
-	uiprogress.Start()
+	if stdoutAndStderrAreSameFile() {
+		log.SetOutput(progress.Bypass())
+	}
+	progress.Start()
 	addTorrents(client)
 	if client.WaitAll() {
 		log.Print("downloaded ALL the torrents")
@@ -186,4 +199,8 @@ func main() {
 	if flags.Seed {
 		select {}
 	}
+	expvar.Do(func(kv expvar.KeyValue) {
+		fmt.Printf("%s: %s\n", kv.Key, kv.Value)
+	})
+	envpprof.Stop()
 }

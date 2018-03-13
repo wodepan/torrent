@@ -1,17 +1,14 @@
 package torrentfs
 
 import (
+	"context"
 	"expvar"
-	"fmt"
-	"io"
 	"os"
-	"path"
 	"strings"
 	"sync"
 
 	"bazil.org/fuse"
 	fusefs "bazil.org/fuse/fs"
-	"golang.org/x/net/context"
 
 	"github.com/anacrolix/torrent"
 	"github.com/anacrolix/torrent/metainfo"
@@ -43,6 +40,8 @@ var (
 	_ fusefs.HandleReadDirAller = dirNode{}
 )
 
+// Is a directory node that lists all torrents and handles destruction of the
+// filesystem.
 type rootNode struct {
 	fs *TorrentFS
 }
@@ -54,107 +53,12 @@ type node struct {
 	t        *torrent.Torrent
 }
 
-type fileNode struct {
-	node
-	size          uint64
-	TorrentOffset int64
-}
-
-func (fn fileNode) Attr(ctx context.Context, attr *fuse.Attr) error {
-	attr.Size = fn.size
-	attr.Mode = defaultMode
-	return nil
-}
-
-func (n *node) fsPath() string {
-	return "/" + n.metadata.Name + "/" + n.path
-}
-
-func blockingRead(ctx context.Context, fs *TorrentFS, t *torrent.Torrent, off int64, p []byte) (n int, err error) {
-	fs.mu.Lock()
-	fs.blockedReads++
-	fs.event.Broadcast()
-	fs.mu.Unlock()
-	var (
-		_n   int
-		_err error
-	)
-	readDone := make(chan struct{})
-	go func() {
-		defer close(readDone)
-		r := t.NewReader()
-		defer r.Close()
-		_, _err = r.Seek(off, os.SEEK_SET)
-		if _err != nil {
-			return
-		}
-		_n, _err = io.ReadFull(r, p)
-	}()
-	select {
-	case <-readDone:
-		n = _n
-		err = _err
-	case <-fs.destroyed:
-		err = fuse.EIO
-	case <-ctx.Done():
-		err = fuse.EINTR
-	}
-	fs.mu.Lock()
-	fs.blockedReads--
-	fs.event.Broadcast()
-	fs.mu.Unlock()
-	return
-}
-
-func readFull(ctx context.Context, fs *TorrentFS, t *torrent.Torrent, off int64, p []byte) (n int, err error) {
-	for len(p) != 0 {
-		var nn int
-		nn, err = blockingRead(ctx, fs, t, off, p)
-		if err != nil {
-			break
-		}
-		n += nn
-		off += int64(nn)
-		p = p[nn:]
-	}
-	return
-}
-
-func (fn fileNode) Read(ctx context.Context, req *fuse.ReadRequest, resp *fuse.ReadResponse) error {
-	torrentfsReadRequests.Add(1)
-	if req.Dir {
-		panic("read on directory")
-	}
-	size := req.Size
-	fileLeft := int64(fn.size) - req.Offset
-	if fileLeft < 0 {
-		fileLeft = 0
-	}
-	if fileLeft < int64(size) {
-		size = int(fileLeft)
-	}
-	resp.Data = resp.Data[:size]
-	if len(resp.Data) == 0 {
-		return nil
-	}
-	torrentOff := fn.TorrentOffset + req.Offset
-	n, err := readFull(ctx, fn.FS, fn.t, torrentOff, resp.Data)
-	if err != nil {
-		return err
-	}
-	if n != size {
-		panic(fmt.Sprintf("%d < %d", n, size))
-	}
-	return nil
-}
-
 type dirNode struct {
 	node
 }
 
 var (
 	_ fusefs.HandleReadDirAller = dirNode{}
-	_ fusefs.HandleReader       = fileNode{}
 )
 
 func isSubPath(parent, child string) bool {
@@ -164,11 +68,12 @@ func isSubPath(parent, child string) bool {
 	if !strings.HasPrefix(child, parent) {
 		return false
 	}
-	s := child[len(parent):]
-	if len(s) == 0 {
+	extra := child[len(parent):]
+	if len(extra) == 0 {
 		return false
 	}
-	return s[0] == '/'
+	// Not just a file with more stuff on the end.
+	return extra[0] == '/'
 }
 
 func (dn dirNode) ReadDirAll(ctx context.Context) (des []fuse.Dirent, err error) {
@@ -195,34 +100,30 @@ func (dn dirNode) ReadDirAll(ctx context.Context) (des []fuse.Dirent, err error)
 	return
 }
 
-func (dn dirNode) Lookup(ctx context.Context, name string) (_node fusefs.Node, err error) {
-	var torrentOffset int64
-	for _, fi := range dn.metadata.Files {
-		if !isSubPath(dn.path, strings.Join(fi.Path, "/")) {
-			torrentOffset += fi.Length
-			continue
+func (dn dirNode) Lookup(_ context.Context, name string) (fusefs.Node, error) {
+	dir := false
+	var file *torrent.File
+	fullPath := dn.path + "/" + name
+	for _, f := range dn.t.Files() {
+		if f.DisplayPath() == fullPath {
+			file = f
 		}
-		if fi.Path[len(dn.path)] != name {
-			torrentOffset += fi.Length
-			continue
+		if isSubPath(fullPath, f.DisplayPath()) {
+			dir = true
 		}
-		__node := dn.node
-		__node.path = path.Join(__node.path, name)
-		if len(fi.Path) == len(dn.path)+1 {
-			_node = fileNode{
-				node:          __node,
-				size:          uint64(fi.Length),
-				TorrentOffset: torrentOffset,
-			}
-		} else {
-			_node = dirNode{__node}
-		}
-		break
 	}
-	if _node == nil {
-		err = fuse.ENOENT
+	n := dn.node
+	n.path = fullPath
+	if dir && file != nil {
+		panic("both dir and file")
 	}
-	return
+	if file != nil {
+		return fileNode{n, file}, nil
+	}
+	if dir {
+		return dirNode{n}, nil
+	}
+	return nil, fuse.ENOENT
 }
 
 func (dn dirNode) Attr(ctx context.Context, attr *fuse.Attr) error {
@@ -242,7 +143,7 @@ func (rn rootNode) Lookup(ctx context.Context, name string) (_node fusefs.Node, 
 			t:        t,
 		}
 		if !info.IsDir() {
-			_node = fileNode{__node, uint64(info.Length), 0}
+			_node = fileNode{__node, t.Files()[0]}
 		} else {
 			_node = dirNode{__node}
 		}

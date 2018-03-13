@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"math"
 	"math/big"
 	"strconv"
 	"sync"
@@ -23,9 +24,12 @@ import (
 const (
 	maxPadLen = 512
 
-	cryptoMethodPlaintext = 1
-	cryptoMethodRC4       = 2
+	CryptoMethodPlaintext CryptoMethod = 1
+	CryptoMethodRC4       CryptoMethod = 2
+	AllSupportedCrypto                 = CryptoMethodPlaintext | CryptoMethodRC4
 )
+
+type CryptoMethod uint32
 
 var (
 	// Prime P according to the spec, and G, the generator.
@@ -82,46 +86,63 @@ func newEncrypt(initer bool, s []byte, skey []byte) (c *rc4.Cipher) {
 }
 
 type cipherReader struct {
-	c *rc4.Cipher
-	r io.Reader
+	c  *rc4.Cipher
+	r  io.Reader
+	mu sync.Mutex
+	be []byte
 }
 
 func (cr *cipherReader) Read(b []byte) (n int, err error) {
-	// inefficient to allocate here
-	be := make([]byte, len(b))
-	n, err = cr.r.Read(be)
+	var be []byte
+	cr.mu.Lock()
+	if len(cr.be) >= len(b) {
+		be = cr.be
+		cr.be = nil
+		cr.mu.Unlock()
+	} else {
+		cr.mu.Unlock()
+		be = make([]byte, len(b))
+	}
+	n, err = cr.r.Read(be[:len(b)])
 	cr.c.XORKeyStream(b[:n], be[:n])
+	cr.mu.Lock()
+	if len(be) > len(cr.be) {
+		cr.be = be
+	}
+	cr.mu.Unlock()
 	return
 }
 
 func newCipherReader(c *rc4.Cipher, r io.Reader) io.Reader {
-	return &cipherReader{c, r}
+	return &cipherReader{c: c, r: r}
 }
 
 type cipherWriter struct {
 	c *rc4.Cipher
 	w io.Writer
+	b []byte
 }
 
 func (cr *cipherWriter) Write(b []byte) (n int, err error) {
-	be := make([]byte, len(b))
-	cr.c.XORKeyStream(be, b)
-	n, err = cr.w.Write(be)
-	if n != len(be) {
+	be := func() []byte {
+		if len(cr.b) < len(b) {
+			return make([]byte, len(b))
+		} else {
+			ret := cr.b
+			cr.b = nil
+			return ret
+		}
+	}()
+	cr.c.XORKeyStream(be[:], b)
+	n, err = cr.w.Write(be[:len(b)])
+	if n != len(b) {
 		// The cipher will have advanced beyond the callers stream position.
 		// We can't use the cipher anymore.
 		cr.c = nil
 	}
-	return
-}
-
-func readY(r io.Reader) (y big.Int, err error) {
-	var b [96]byte
-	_, err = io.ReadFull(r, b[:])
-	if err != nil {
-		return
+	if len(be) > len(cr.b) {
+		cr.b = be
 	}
-	y.SetBytes(b[:])
 	return
 }
 
@@ -156,20 +177,20 @@ func (h *handshake) postY(x *big.Int) error {
 	return h.postWrite(paddedLeft(y.Bytes(), 96))
 }
 
-func (h *handshake) establishS() (err error) {
+func (h *handshake) establishS() error {
 	x := newX()
 	h.postY(&x)
 	var b [96]byte
-	_, err = io.ReadFull(h.conn, b[:])
+	_, err := io.ReadFull(h.conn, b[:])
 	if err != nil {
-		return
+		return fmt.Errorf("error reading Y: %s", err)
 	}
 	var Y, S big.Int
 	Y.SetBytes(b[:])
 	S.Exp(&Y, &x, &p)
 	sBytes := S.Bytes()
 	copy(h.s[96-len(sBytes):96], sBytes)
-	return
+	return nil
 }
 
 func newPadLen() int64 {
@@ -192,6 +213,10 @@ type handshake struct {
 	skeys  SecretKeyIter // Skeys we'll accept if receiving.
 	skey   []byte        // Skey we're initiating with.
 	ia     []byte        // Initial payload. Only used by the initiator.
+	// Return the bit for the crypto method the receiver wants to use.
+	chooseMethod CryptoSelector
+	// Sent to the receiver.
+	cryptoProvides CryptoMethod
 
 	writeMu    sync.Mutex
 	writes     [][]byte
@@ -215,7 +240,6 @@ func (h *handshake) finishWriting() {
 		h.writerCond.Wait()
 	}
 	h.writerMu.Unlock()
-	return
 }
 
 func (h *handshake) writer() {
@@ -343,12 +367,16 @@ func (h *handshake) newEncrypt(initer bool) *rc4.Cipher {
 	return newEncrypt(initer, h.s[:], h.skey)
 }
 
-func (h *handshake) initerSteps() (ret io.ReadWriter, err error) {
+func (h *handshake) initerSteps() (ret io.ReadWriter, selected CryptoMethod, err error) {
 	h.postWrite(hash(req1, h.s[:]))
 	h.postWrite(xor(hash(req2, h.skey), hash(req3, h.s[:])))
 	buf := &bytes.Buffer{}
 	padLen := uint16(newPadLen())
-	err = marshal(buf, vc[:], uint32(cryptoMethodRC4), padLen, zeroPad[:padLen], uint16(len(h.ia)), h.ia)
+	if len(h.ia) > math.MaxUint16 {
+		err = errors.New("initial payload too large")
+		return
+	}
+	err = marshal(buf, vc[:], h.cryptoProvides, padLen, zeroPad[:padLen], uint16(len(h.ia)), h.ia)
 	if err != nil {
 		return
 	}
@@ -371,27 +399,31 @@ func (h *handshake) initerSteps() (ret io.ReadWriter, err error) {
 		}
 		return
 	}
-	r := &cipherReader{bC, h.conn}
-	var method uint32
+	r := newCipherReader(bC, h.conn)
+	var method CryptoMethod
 	err = unmarshal(r, &method, &padLen)
 	if err != nil {
-		return
-	}
-	if method != cryptoMethodRC4 {
-		err = fmt.Errorf("receiver chose unsupported method: %x", method)
 		return
 	}
 	_, err = io.CopyN(ioutil.Discard, r, int64(padLen))
 	if err != nil {
 		return
 	}
-	ret = readWriter{r, &cipherWriter{e, h.conn}}
+	selected = method & h.cryptoProvides
+	switch selected {
+	case CryptoMethodRC4:
+		ret = readWriter{r, &cipherWriter{e, h.conn, nil}}
+	case CryptoMethodPlaintext:
+		ret = h.conn
+	default:
+		err = fmt.Errorf("receiver chose unsupported method: %x", method)
+	}
 	return
 }
 
 var ErrNoSecretKeyMatch = errors.New("no skey matched")
 
-func (h *handshake) receiverSteps() (ret io.ReadWriter, err error) {
+func (h *handshake) receiverSteps() (ret io.ReadWriter, chosen CryptoMethod, err error) {
 	// There is up to 512 bytes of padding, then the 20 byte hash.
 	err = readUntil(io.LimitReader(h.conn, 532), hash(req1, h.s[:]))
 	if err != nil {
@@ -419,20 +451,17 @@ func (h *handshake) receiverSteps() (ret io.ReadWriter, err error) {
 	}
 	r := newCipherReader(newEncrypt(true, h.s[:], h.skey), h.conn)
 	var (
-		vc     [8]byte
-		method uint32
-		padLen uint16
+		vc       [8]byte
+		provides CryptoMethod
+		padLen   uint16
 	)
 
-	err = unmarshal(r, vc[:], &method, &padLen)
+	err = unmarshal(r, vc[:], &provides, &padLen)
 	if err != nil {
 		return
 	}
-	cryptoProvidesCount.Add(strconv.FormatUint(uint64(method), 16), 1)
-	if method&cryptoMethodRC4 == 0 {
-		err = errors.New("no supported crypto methods were provided")
-		return
-	}
+	cryptoProvidesCount.Add(strconv.FormatUint(uint64(provides), 16), 1)
+	chosen = h.chooseMethod(provides)
 	_, err = io.CopyN(ioutil.Discard, r, int64(padLen))
 	if err != nil {
 		return
@@ -444,9 +473,9 @@ func (h *handshake) receiverSteps() (ret io.ReadWriter, err error) {
 		unmarshal(r, h.ia)
 	}
 	buf := &bytes.Buffer{}
-	w := cipherWriter{h.newEncrypt(false), buf}
+	w := cipherWriter{h.newEncrypt(false), buf, nil}
 	padLen = uint16(newPadLen())
-	err = marshal(&w, &vc, uint32(cryptoMethodRC4), padLen, zeroPad[:padLen])
+	err = marshal(&w, &vc, uint32(chosen), padLen, zeroPad[:padLen])
 	if err != nil {
 		return
 	}
@@ -454,11 +483,24 @@ func (h *handshake) receiverSteps() (ret io.ReadWriter, err error) {
 	if err != nil {
 		return
 	}
-	ret = readWriter{io.MultiReader(bytes.NewReader(h.ia), r), &cipherWriter{w.c, h.conn}}
+	switch chosen {
+	case CryptoMethodRC4:
+		ret = readWriter{
+			io.MultiReader(bytes.NewReader(h.ia), r),
+			&cipherWriter{w.c, h.conn, nil},
+		}
+	case CryptoMethodPlaintext:
+		ret = readWriter{
+			io.MultiReader(bytes.NewReader(h.ia), h.conn),
+			h.conn,
+		}
+	default:
+		err = errors.New("chosen crypto method is not supported")
+	}
 	return
 }
 
-func (h *handshake) Do() (ret io.ReadWriter, err error) {
+func (h *handshake) Do() (ret io.ReadWriter, method CryptoMethod, err error) {
 	h.writeCond.L = &h.writeMu
 	h.writerCond.L = &h.writerMu
 	go h.writer()
@@ -480,53 +522,43 @@ func (h *handshake) Do() (ret io.ReadWriter, err error) {
 		return
 	}
 	if h.initer {
-		ret, err = h.initerSteps()
+		ret, method, err = h.initerSteps()
 	} else {
-		ret, err = h.receiverSteps()
+		ret, method, err = h.receiverSteps()
 	}
 	return
 }
 
-func InitiateHandshake(rw io.ReadWriter, skey []byte, initialPayload []byte) (ret io.ReadWriter, err error) {
+func InitiateHandshake(rw io.ReadWriter, skey []byte, initialPayload []byte, cryptoProvides CryptoMethod) (ret io.ReadWriter, method CryptoMethod, err error) {
 	h := handshake{
-		conn:   rw,
-		initer: true,
-		skey:   skey,
-		ia:     initialPayload,
+		conn:           rw,
+		initer:         true,
+		skey:           skey,
+		ia:             initialPayload,
+		cryptoProvides: cryptoProvides,
 	}
 	return h.Do()
 }
 
-func ReceiveHandshake(rw io.ReadWriter, skeys [][]byte) (ret io.ReadWriter, err error) {
+func ReceiveHandshake(rw io.ReadWriter, skeys SecretKeyIter, selectCrypto CryptoSelector) (ret io.ReadWriter, method CryptoMethod, err error) {
 	h := handshake{
-		conn:   rw,
-		initer: false,
-		skeys:  sliceIter(skeys),
+		conn:         rw,
+		initer:       false,
+		skeys:        skeys,
+		chooseMethod: selectCrypto,
 	}
 	return h.Do()
-}
-
-func sliceIter(skeys [][]byte) SecretKeyIter {
-	return func(callback func([]byte) bool) {
-		for _, sk := range skeys {
-			if !callback(sk) {
-				break
-			}
-		}
-	}
 }
 
 // A function that given a function, calls it with secret keys until it
 // returns false or exhausted.
 type SecretKeyIter func(callback func(skey []byte) (more bool))
 
-// Doesn't unpack the secret keys until it needs to, and through the passed
-// function.
-func ReceiveHandshakeLazy(rw io.ReadWriter, skeys SecretKeyIter) (ret io.ReadWriter, err error) {
-	h := handshake{
-		conn:   rw,
-		initer: false,
-		skeys:  skeys,
+func DefaultCryptoSelector(provided CryptoMethod) CryptoMethod {
+	if provided&CryptoMethodPlaintext != 0 {
+		return CryptoMethodPlaintext
 	}
-	return h.Do()
+	return CryptoMethodRC4
 }
+
+type CryptoSelector func(CryptoMethod) CryptoMethod

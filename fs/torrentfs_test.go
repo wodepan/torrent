@@ -1,6 +1,8 @@
 package torrentfs
 
 import (
+	"context"
+	netContext "context"
 	"fmt"
 	"io/ioutil"
 	"log"
@@ -8,7 +10,6 @@ import (
 	_ "net/http/pprof"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
@@ -18,7 +19,6 @@ import (
 	"github.com/anacrolix/missinggo"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	netContext "golang.org/x/net/context"
 
 	"github.com/anacrolix/torrent"
 	"github.com/anacrolix/torrent/internal/testutil"
@@ -102,11 +102,13 @@ func TestUnmountWedged(t *testing.T) {
 	fs := New(client)
 	fuseConn, err := fuse.Mount(layout.MountDir)
 	if err != nil {
-		msg := fmt.Sprintf("error mounting: %s", err)
-		if strings.Contains(err.Error(), "fuse") || err.Error() == "exit status 71" {
-			t.Skip(msg)
+		switch err.Error() {
+		case "cannot locate OSXFUSE":
+			fallthrough
+		case "fusermount: exit status 1":
+			t.Skip(err)
 		}
-		t.Fatal(msg)
+		t.Fatal(err)
 	}
 	go func() {
 		server := fusefs.New(fuseConn, &fusefs.Config{
@@ -120,19 +122,25 @@ func TestUnmountWedged(t *testing.T) {
 	if err := fuseConn.MountError; err != nil {
 		t.Fatalf("mount error: %s", err)
 	}
+	ctx, cancel := context.WithCancel(context.Background())
 	// Read the greeting file, though it will never be available. This should
 	// "wedge" FUSE, requiring the fs object to be forcibly destroyed. The
 	// read call will return with a FS error.
 	go func() {
+		<-ctx.Done()
+		fs.mu.Lock()
+		fs.event.Broadcast()
+		fs.mu.Unlock()
+	}()
+	go func() {
+		defer cancel()
 		_, err := ioutil.ReadFile(filepath.Join(layout.MountDir, tt.Info().Name))
-		if err == nil {
-			t.Fatal("expected error reading greeting")
-		}
+		require.Error(t, err)
 	}()
 
 	// Wait until the read has blocked inside the filesystem code.
 	fs.mu.Lock()
-	for fs.blockedReads != 1 {
+	for fs.blockedReads != 1 && ctx.Err() == nil {
 		fs.event.Wait()
 	}
 	fs.mu.Unlock()
@@ -150,9 +158,7 @@ func TestUnmountWedged(t *testing.T) {
 	}
 
 	err = fuseConn.Close()
-	if err != nil {
-		t.Fatalf("error closing fuse conn: %s", err)
-	}
+	assert.NoError(t, err)
 }
 
 func TestDownloadOnDemand(t *testing.T) {
@@ -169,8 +175,15 @@ func TestDownloadOnDemand(t *testing.T) {
 	require.NoError(t, err)
 	defer seeder.Close()
 	testutil.ExportStatusWriter(seeder, "s")
-	_, err = seeder.AddMagnet(fmt.Sprintf("magnet:?xt=urn:btih:%s", layout.Metainfo.HashInfoBytes().HexString()))
+	// Just to mix things up, the seeder starts with the data, but the leecher
+	// starts with the metainfo.
+	seederTorrent, err := seeder.AddMagnet(fmt.Sprintf("magnet:?xt=urn:btih:%s", layout.Metainfo.HashInfoBytes().HexString()))
 	require.NoError(t, err)
+	go func() {
+		// Wait until we get the metainfo, then check for the data.
+		<-seederTorrent.GotInfo()
+		seederTorrent.VerifyData()
+	}()
 	leecher, err := torrent.NewClient(&torrent.Config{
 		DisableTrackers: true,
 		NoDHT:           true,
@@ -201,7 +214,9 @@ func TestDownloadOnDemand(t *testing.T) {
 	resp := &fuse.ReadResponse{
 		Data: make([]byte, size),
 	}
-	node.(fusefs.HandleReader).Read(netContext.Background(), &fuse.ReadRequest{
+	h, err := node.(fusefs.NodeOpener).Open(context.TODO(), nil, nil)
+	require.NoError(t, err)
+	h.(fusefs.HandleReader).Read(netContext.Background(), &fuse.ReadRequest{
 		Size: int(size),
 	}, resp)
 	assert.EqualValues(t, testutil.GreetingFileContents, resp.Data)

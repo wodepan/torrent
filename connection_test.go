@@ -1,15 +1,11 @@
 package torrent
 
 import (
-	"container/list"
 	"io"
-	"io/ioutil"
-	"net"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/anacrolix/missinggo/bitmap"
 	"github.com/anacrolix/missinggo/pubsub"
 	"github.com/bradfitz/iter"
 	"github.com/stretchr/testify/assert"
@@ -20,62 +16,23 @@ import (
 	"github.com/anacrolix/torrent/storage"
 )
 
-func TestCancelRequestOptimized(t *testing.T) {
-	r, w := io.Pipe()
-	c := &connection{
-		PeerMaxRequests: 1,
-		peerPieces: func() bitmap.Bitmap {
-			var bm bitmap.Bitmap
-			bm.Set(1, true)
-			return bm
-		}(),
-		w:    w,
-		conn: new(net.TCPConn),
-		// For the locks
-		t: &Torrent{cl: &Client{}},
-	}
-	assert.Len(t, c.Requests, 0)
-	c.Request(newRequest(1, 2, 3))
-	require.Len(t, c.Requests, 1)
-	// Posting this message should removing the pending Request.
-	require.True(t, c.Cancel(newRequest(1, 2, 3)))
-	assert.Len(t, c.Requests, 0)
-	// Check that write optimization filters out the Request, due to the
-	// Cancel. We should have received an Interested, due to the initial
-	// request, and then keep-alives until we close the connection.
-	go c.writer(0)
-	b := make([]byte, 9)
-	n, err := io.ReadFull(r, b)
-	require.NoError(t, err)
-	require.EqualValues(t, len(b), n)
-	require.EqualValues(t, "\x00\x00\x00\x01\x02"+"\x00\x00\x00\x00", string(b))
-	time.Sleep(time.Millisecond)
-	c.mu().Lock()
-	c.Close()
-	c.mu().Unlock()
-	w.Close()
-	b, err = ioutil.ReadAll(r)
-	require.NoError(t, err)
-	// A single keep-alive will have gone through, as writer would be stuck
-	// trying to flush it, and then promptly close.
-	require.EqualValues(t, "\x00\x00\x00\x00", string(b))
-}
-
 // Ensure that no race exists between sending a bitfield, and a subsequent
 // Have that would potentially alter it.
 func TestSendBitfieldThenHave(t *testing.T) {
 	r, w := io.Pipe()
-	c := &connection{
-		t: &Torrent{
-			cl: &Client{},
-		},
-		r: r,
-		w: w,
-		outgoingUnbufferedMessages: list.New(),
-	}
+	var cl Client
+	cl.initLogger()
+	c := cl.newConnection(nil)
+	c.setTorrent(cl.newTorrent(metainfo.Hash{}, nil))
+	c.t.setInfo(&metainfo.Info{
+		Pieces: make([]byte, metainfo.HashSize*3),
+	})
+	c.r = r
+	c.w = w
 	go c.writer(time.Minute)
 	c.mu().Lock()
-	c.Bitfield([]bool{false, true, false})
+	c.t.completedPieces.Add(1)
+	c.PostBitfield( /*[]bool{false, true, false}*/ )
 	c.mu().Unlock()
 	c.mu().Lock()
 	c.Have(2)
@@ -103,8 +60,8 @@ func (me *torrentStorage) Piece(mp metainfo.Piece) storage.PieceImpl {
 	return me
 }
 
-func (me *torrentStorage) GetIsComplete() bool {
-	return false
+func (me *torrentStorage) Completion() storage.Completion {
+	return storage.Completion{}
 }
 
 func (me *torrentStorage) MarkComplete() error {
@@ -131,18 +88,17 @@ func BenchmarkConnectionMainReadLoop(b *testing.B) {
 	cl := &Client{}
 	ts := &torrentStorage{}
 	t := &Torrent{
-		cl: cl,
-		info: &metainfo.Info{
-			Pieces:      make([]byte, 20),
-			Length:      1 << 20,
-			PieceLength: 1 << 20,
-		},
+		cl:                cl,
 		storage:           &storage.Torrent{ts},
 		pieceStateChanges: pubsub.NewPubSub(),
 	}
+	require.NoError(b, t.setInfo(&metainfo.Info{
+		Pieces:      make([]byte, 20),
+		Length:      1 << 20,
+		PieceLength: 1 << 20,
+	}))
 	t.setChunkSize(defaultChunkSize)
-	t.makePieces()
-	t.pendingPieces.Add(0)
+	t.pendingPieces.Set(0, PiecePriorityNormal.BitmapPriority())
 	r, w := io.Pipe()
 	cn := &connection{
 		t: t,
@@ -167,7 +123,7 @@ func BenchmarkConnectionMainReadLoop(b *testing.B) {
 	ts.writeSem.Lock()
 	for range iter.N(b.N) {
 		cl.mu.Lock()
-		t.pieces[0].DirtyChunks.Clear()
+		t.pieces[0].dirtyChunks.Clear()
 		cl.mu.Unlock()
 		n, err := w.Write(wb)
 		require.NoError(b, err)
@@ -176,7 +132,7 @@ func BenchmarkConnectionMainReadLoop(b *testing.B) {
 	}
 	w.Close()
 	require.NoError(b, <-mrlErr)
-	require.EqualValues(b, b.N, cn.UsefulChunksReceived)
+	require.EqualValues(b, b.N, cn.stats.ChunksReadUseful)
 }
 
 func TestConnectionReceiveBadChunkIndex(t *testing.T) {
@@ -184,8 +140,8 @@ func TestConnectionReceiveBadChunkIndex(t *testing.T) {
 		t: &Torrent{},
 	}
 	require.False(t, cn.t.haveInfo())
-	assert.NotPanics(t, func() { cn.receiveChunk(&pp.Message{}) })
+	assert.NotPanics(t, func() { cn.receiveChunk(&pp.Message{Type: pp.Piece}) })
 	cn.t.info = &metainfo.Info{}
 	require.True(t, cn.t.haveInfo())
-	assert.NotPanics(t, func() { cn.receiveChunk(&pp.Message{}) })
+	assert.NotPanics(t, func() { cn.receiveChunk(&pp.Message{Type: pp.Piece}) })
 }
